@@ -1,27 +1,24 @@
 """
-
-
-Compression-Aware Encoder Training with 16-Gate Pruning for ResNet-18 on CIFAR-10
-
-
+Compression-Aware Encoder Training with 16-Gate Pruning for ResNet-18 on Tiny ImageNet-200
 """
 
 import os, math, random, torch, torch.nn as nn, torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms, models
+from PIL import Image
 import json
 
 # =========================
 # Config
 # =========================
-DATA_DIR = "data"
+DATA_DIR = "data/tiny-imagenet-200"
 CKPT = "checkpoints/teacher.pth"
 OUT_DIR = "checkpoints"
-RESULTS_FILE = "checkpoints/encoder_16gate_results.json"
+RESULTS_FILE = "encoder_16gate_results_tinyimagenet.json"
 
-BATCH_SIZE = 128
-NUM_WORKERS = 0
-IMG_SIZE = 224
+BATCH_SIZE = 512
+NUM_WORKERS = 4
+IMG_SIZE = 224  
 TOKEN_DIM = 128
 SUM_DIM = 64
 ENC_WIDTH = 128
@@ -65,14 +62,57 @@ def set_seed(seed=SEED):
     torch.backends.cudnn.benchmark = True
 
 # =========================
-# Data
+# Custom Dataset for Tiny ImageNet Validation
+# =========================
+class TinyImageNetVal(Dataset):
+    """Custom dataset for Tiny ImageNet validation set."""
+    def __init__(self, root, transform=None):
+        self.root = root
+        self.transform = transform
+        
+        # Read val_annotations.txt
+        annotations_file = os.path.join(root, 'val_annotations.txt')
+        self.images = []
+        self.labels = []
+        
+        # Build class to index mapping from train folder
+        train_dir = os.path.join(os.path.dirname(root), 'train')
+        self.class_to_idx = {cls: idx for idx, cls in enumerate(sorted(os.listdir(train_dir)))}
+        
+        # Parse annotations
+        with open(annotations_file, 'r') as f:
+            for line in f:
+                parts = line.strip().split('\t')
+                img_name = parts[0]
+                class_id = parts[1]
+                
+                self.images.append(os.path.join(root, 'images', img_name))
+                self.labels.append(self.class_to_idx[class_id])
+    
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        label = self.labels[idx]
+        
+        image = Image.open(img_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, label
+
+# =========================
+# Data Loading
 # =========================
 def get_loaders():
-    mean = (0.4914, 0.4822, 0.4465)
-    std  = (0.2470, 0.2435, 0.2616)
+    """Load Tiny ImageNet-200 dataset."""
+    mean = (0.485, 0.456, 0.406)  # ImageNet stats
+    std  = (0.229, 0.224, 0.225)
+    
     train_tf = transforms.Compose([
         transforms.Resize(IMG_SIZE),
-        transforms.RandomCrop(IMG_SIZE, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
@@ -82,19 +122,38 @@ def get_loaders():
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
-    train_ds = datasets.CIFAR10(root=DATA_DIR, train=True, transform=train_tf, download=True)
-    test_ds  = datasets.CIFAR10(root=DATA_DIR, train=False, transform=test_tf, download=True)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=True)
-    test_loader  = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False,
-                              num_workers=NUM_WORKERS, pin_memory=True)
-    return train_loader, test_loader
+    
+    # Training: use ImageFolder (class-based structure)
+    train_ds = datasets.ImageFolder(root=os.path.join(DATA_DIR, 'train'), transform=train_tf)
+    
+    # Validation: use custom dataset (flat structure with annotations)
+    val_ds = TinyImageNetVal(root=os.path.join(DATA_DIR, 'val'), transform=test_tf)
+    
+    num_classes = len(train_ds.classes)
+    print(f"✓ Dataset loaded: {len(train_ds)} train images, {len(val_ds)} val images, {num_classes} classes")
+    
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, shuffle=True,  
+        num_workers=NUM_WORKERS, pin_memory=True,
+        persistent_workers=True, prefetch_factor=2
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=BATCH_SIZE*2, shuffle=False, 
+        num_workers=NUM_WORKERS, pin_memory=True,
+        persistent_workers=True, prefetch_factor=2
+    )
+    
+    return train_loader, val_loader, num_classes
 
 # =========================
 # Models
 # =========================
-def build_resnet18_teacher(num_classes=10):
-    return models.resnet18(weights=None, num_classes=num_classes)
+def build_resnet18_teacher(num_classes=200):
+    """Build ResNet-18 for Tiny ImageNet (200 classes)."""
+    model = models.resnet18(weights=None)
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
+    return model
 
 class Summarizer(nn.Module):
     def __init__(self, sum_dim=SUM_DIM, k=64):
@@ -153,7 +212,6 @@ class CompressionAwareEncoder(nn.Module):
         self.head = nn.Linear(dim, 1)
 
     def forward(self, tokens, target_ratio):
-        # FIX1: device/shape safe
         if not torch.is_tensor(target_ratio):
             target_ratio = torch.tensor([[float(target_ratio)]], dtype=torch.float32, device=tokens.device)
         else:
@@ -164,7 +222,7 @@ class CompressionAwareEncoder(nn.Module):
         x = x + self.pos[:, :x.size(1)]
         h = self.enc(x)
         block_h = h[:, 1:, :]
-        logits = self.head(block_h).squeeze(-1)   # [B(=1), NUM_UNITS] -> [NUM_UNITS]
+        logits = self.head(block_h).squeeze(-1)
         return logits
 
 # =========================
@@ -203,13 +261,13 @@ def collect_block_infos_teacher(teacher: models.ResNet, x: torch.Tensor):
             gamma1 = block.bn1.weight.abs().sum().item()
             gamma2 = block.bn2.weight.abs().sum().item()
 
-            # stride=2 if downsample exists (in torchvision BasicBlock, it's the stage transition)
+            # stride=2 if downsample exists
             down = (block.downsample is not None)
 
             # unit 0 = conv1
             infos.append({
                 "stage": s, "idx": i, "sub": 0,
-                "h_in": h_in, "r": r1,       # summarizer(h_in, r1)
+                "h_in": h_in, "r": r1,
                 "C_in": h_in.size(1), "C_mid": r1.size(1),
                 "H": h_in.size(2), "W": h_in.size(3),
                 "down": down,
@@ -218,47 +276,33 @@ def collect_block_infos_teacher(teacher: models.ResNet, x: torch.Tensor):
             # unit 1 = conv2
             infos.append({
                 "stage": s, "idx": i, "sub": 1,
-                "h_in": r1_relu, "r": r2,    # summarizer(r1_relu, r2)
-                "C_in": r1.size(1), "C_mid": r2.size(1),  # both are Cout
+                "h_in": r1_relu, "r": r2,
+                "C_in": r1.size(1), "C_mid": r2.size(1),
                 "H": r1.size(2), "W": r1.size(3),
-                "down": False,               # conv2 stride=1
+                "down": False,
                 "bn_gamma": gamma2,
             })
     return infos
 
 def estimate_unit_flops(info):
-    """
-    Per-unit FLOPs:
-      - unit 0 (conv1): conv3x3 on (H/stride,W/stride) + downsample(1x1,stride) if exists
-      - unit 1 (conv2): conv3x3 on (H/stride=1) -> use the conv1's output spatial size
-    We approximate conv2's H,W as conv1 output H1,W1 (if conv1 had stride=2).
-    To do that, we compute H1,W1 locally using 'down' flag from unit 0.
-    For unit 1, we must know whether its block had stride=2 in conv1; we infer by stage boundary:
-    Here we pass unit dicts in order, so the pair is contiguous: unit0 then unit1.
-    To avoid cross-couple, we store H,W for each unit as "its input spatial size".
-    For conv1 unit, output H1,W1 = ceil(H/stride). For conv2 unit, input is r1_relu, already H1,W1.
-    """
+    """Per-unit FLOPs estimation."""
     Cin = info["C_in"]
     Cout = info["C_mid"]
     H, W = info["H"], info["W"]
     if info["sub"] == 0:
         stride = 2 if info["down"] else 1
         H1, W1 = math.ceil(H/stride), math.ceil(W/stride)
-        f  = conv_flops(H1, W1, Cin, Cout, 3)     # conv1
+        f  = conv_flops(H1, W1, Cin, Cout, 3)
         if info["down"]:
-            f += H1 * W1 * Cin * Cout             # downsample 1x1
+            f += H1 * W1 * Cin * Cout
         return float(f)
     else:
-        # conv2 (stride=1), spatial is whatever came out of conv1 (already reflected in H,W)
         f = conv_flops(H, W, Cin, Cout, 3)
         return float(f)
 
 def resnet18_forward_collect_r1r2(student: models.ResNet, x: torch.Tensor, gates: torch.Tensor=None,
                                   need_lists: bool=False):
-    """
-    Student forward with 16 gates: per BasicBlock, gate on conv1 output and conv2 output.
-    If need_lists=True, return r1_list and r2_list (requires_grad) for Taylor.
-    """
+    """Student forward with 16 gates."""
     if gates is None:
         gates = torch.ones(NUM_UNITS, device=x.device)
     assert len(gates) == NUM_UNITS
@@ -266,13 +310,13 @@ def resnet18_forward_collect_r1r2(student: models.ResNet, x: torch.Tensor, gates
     r1_list, r2_list = [], []
     g_idx = 0
 
+    # Enable gradients for input when we need to collect gradients
+    if need_lists:
+        x = x.requires_grad_(True)
+
     h = student.conv1(x); h = student.bn1(h); h = student.relu(h); h = student.maxpool(h)
     for layer in [student.layer1, student.layer2, student.layer3, student.layer4]:
         for block in layer:
-            
-            h = h.detach()
-            h.requires_grad_(True)
-            
             # conv1
             r1 = block.conv1(h); r1 = block.bn1(r1); r1 = block.relu(r1)
             if need_lists:
@@ -300,15 +344,13 @@ def resnet18_forward_collect_r1r2(student: models.ResNet, x: torch.Tensor, gates
     return logits, r1_list, r2_list
 
 def build_tokens_with_taylor16(teacher, student, summarizer, token_proj, x, y_T, device):
-    """
-    Build 16 tokens (2 per block) + FLOPs vector length=16 + Taylor sensitivities for r1 & r2.
-    """
+    """Build 16 tokens + FLOPs vector + Taylor sensitivities."""
     teacher.eval(); student.eval()
     with torch.no_grad():
         _ = teacher(x)
-        infos = collect_block_infos_teacher(teacher, x)  # len=16
+        infos = collect_block_infos_teacher(teacher, x)
 
-    # KD forward/backward to get grads on r1 and r2
+    # KD forward/backward
     logits_S, r1_list, r2_list = resnet18_forward_collect_r1r2(student, x, gates=None, need_lists=True)
     kd = kd_loss(logits_S, y_T, T=TEMP_KD)
     kd.backward()
@@ -319,33 +361,32 @@ def build_tokens_with_taylor16(teacher, student, summarizer, token_proj, x, y_T,
             taylor_vals.append(0.0)
         else:
             taylor_vals.append((r.grad * r).abs().mean().detach().item())
-    # clear grads on r tensors
+    
     for r in r1_list + r2_list:
         if r.grad is not None:
             r.grad.detach_(); r.grad.zero_()
     del r1_list, r2_list
 
-    # assemble tokens
     taylor_tensor = torch.tensor([math.log1p(v) for v in taylor_vals], dtype=torch.float32, device=device)
     token_list, flops_list = [], []
     for idx, info in enumerate(infos):
         s = summarizer(info["h_in"], info["r"]).to(device)
-        C = float(info["C_in"] + info["C_mid"])  # scale for gamma
+        C = float(info["C_in"] + info["C_mid"])
         static = torch.tensor([
             info["stage"]/3.0,
             info["idx"]/1.0,
-            float(info["sub"]),                   # NEW: sub_id (0 for conv1, 1 for conv2)
+            float(info["sub"]),
             info["bn_gamma"] / (C + 1e-6),
             info["H"]/IMG_SIZE, info["W"]/IMG_SIZE
         ], dtype=torch.float32, device=device)
         tay = taylor_tensor[idx].view(1)
-        tok = torch.cat([s, static, tay], dim=0)  # SUM_DIM + 6 + 1
+        tok = torch.cat([s, static, tay], dim=0)
         token_list.append(tok)
         flops_list.append(estimate_unit_flops(info))
 
-    tokens = torch.stack(token_list, dim=0).unsqueeze(0)              # [1, 16, SUM_DIM+7]
-    tokens = token_proj(tokens)                                       # [1, 16, TOKEN_DIM]
-    flops = torch.tensor(flops_list, dtype=torch.float32, device=device)  # [16]
+    tokens = torch.stack(token_list, dim=0).unsqueeze(0)
+    tokens = token_proj(tokens)
+    flops = torch.tensor(flops_list, dtype=torch.float32, device=device)
     return tokens, flops
 
 def resnet18_masked_forward_with_gates16(student: models.ResNet, x: torch.Tensor, gates: torch.Tensor):
@@ -394,14 +435,13 @@ def train_policy_encoder(teacher, train_loader, test_loader):
     print("PHASE 1: Training Compression-Aware Policy Encoder (16-gate)")
     print("="*80)
 
-    # frozen student (for Taylor & masked KD forward)
-    student = build_resnet18_teacher(num_classes=10).to(device)
+    student = build_resnet18_teacher(num_classes=200).to(device)
     student.load_state_dict(teacher.state_dict())
     for p in student.parameters(): p.requires_grad = False
     student.eval()
 
     summarizer = Summarizer(sum_dim=SUM_DIM, k=64).to(device)
-    token_proj = TokenProj(SUM_DIM + 7, TOKEN_DIM).to(device)  # SUM + [stage,idx,sub,gamma,H,W]=6 + taylor=1  => +7
+    token_proj = TokenProj(SUM_DIM + 7, TOKEN_DIM).to(device)
     encoder = CompressionAwareEncoder(dim=ENC_WIDTH, depth=ENC_LAYERS, heads=ENC_HEADS, num_blocks=NUM_UNITS).to(device)
 
     params = (list(summarizer.parameters()) +
@@ -431,8 +471,8 @@ def train_policy_encoder(teacher, train_loader, test_loader):
             tokens, flops = build_tokens_with_taylor16(teacher, student, summarizer, token_proj, x, y_T, device)
 
             target_ratio = random.uniform(MIN_RATIO, MAX_RATIO)
-            logits = encoder(tokens, target_ratio).squeeze(0)     # [16]
-            m = torch.sigmoid(logits / gate_temp)                 # [16]
+            logits = encoder(tokens, target_ratio).squeeze(0)
+            m = torch.sigmoid(logits / gate_temp)
 
             exp_flops = (m * flops).sum()
             full_flops = flops.sum() + 1e-6
@@ -465,13 +505,10 @@ def train_policy_encoder(teacher, train_loader, test_loader):
 # PHASE 2: Materialize Masks and Fine-tune
 # =========================
 def materialize_mask_for_ratio(encoder, summarizer, token_proj, teacher, train_loader, target_ratio):
-    """
-    Generate a 16-d binary mask with cost-aware greedy.
-    Reuse a single frozen student_once for Taylor.
-    """
+    """Generate a 16-d binary mask with cost-aware greedy."""
     encoder.eval(); summarizer.eval(); token_proj.eval(); teacher.eval()
 
-    student_once = build_resnet18_teacher(num_classes=10).to(device)
+    student_once = build_resnet18_teacher(num_classes=200).to(device)
     student_once.load_state_dict(teacher.state_dict())
     for p in student_once.parameters(): p.requires_grad = False
     student_once.eval()
@@ -486,7 +523,7 @@ def materialize_mask_for_ratio(encoder, summarizer, token_proj, teacher, train_l
         with torch.no_grad():
             y_T = teacher(x)
         tokens, flops = build_tokens_with_taylor16(teacher, student_once, summarizer, token_proj, x, y_T, device)
-        logits = encoder(tokens, target_ratio).squeeze(0)   # [16]
+        logits = encoder(tokens, target_ratio).squeeze(0)
         scores = torch.sigmoid(logits)
         all_scores.append(scores)
         if all_flops is None:
@@ -494,7 +531,7 @@ def materialize_mask_for_ratio(encoder, summarizer, token_proj, teacher, train_l
         itr += 1
         if itr >= iters: break
 
-    avg_scores = torch.stack(all_scores, dim=0).mean(dim=0) # [16]
+    avg_scores = torch.stack(all_scores, dim=0).mean(dim=0)
     flops = all_flops
 
     eff = (avg_scores.detach() / (flops + 1e-9)).cpu().numpy().tolist()
@@ -520,11 +557,10 @@ def materialize_mask_for_ratio(encoder, summarizer, token_proj, teacher, train_l
     return mask, actual_ratio.item(), avg_scores.tolist()
 
 def resnet18_masked_forward_with_binary_mask16(student, x, mask):
-    # convenience wrapper that expects 0/1 mask
     return resnet18_masked_forward_with_gates16(student, x, mask)
 
 def finetune_pruned_model(teacher, mask, actual_ratio, train_loader, test_loader):
-    student = build_resnet18_teacher(num_classes=10).to(device)
+    student = build_resnet18_teacher(num_classes=200).to(device)
     student.load_state_dict(teacher.state_dict())
     for p in student.parameters(): p.requires_grad = True
 
@@ -556,9 +592,10 @@ def main():
     set_seed()
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    train_loader, test_loader = get_loaders()
+    train_loader, test_loader, num_classes = get_loaders()
+    print(f"✓ Number of classes: {num_classes}")
 
-    teacher = build_resnet18_teacher(num_classes=10)
+    teacher = build_resnet18_teacher(num_classes=num_classes)
     ckpt = torch.load(CKPT, map_location="cpu")
     teacher.load_state_dict(ckpt["state_dict"])
     teacher.to(device).eval()
@@ -566,20 +603,22 @@ def main():
     teacher_acc = evaluate_accuracy(teacher, test_loader)
     print(f"\nTeacher accuracy (unpruned): {teacher_acc*100:.2f}%")
 
-    if not os.path.exists(os.path.join(OUT_DIR, "compression_aware_encoder_16gate.pth")):
+    encoder_path = os.path.join(OUT_DIR, "compression_aware_encoder_16gate_tinyimagenet.pth")
+    
+    if not os.path.exists(encoder_path):
         encoder, summarizer, token_proj = train_policy_encoder(teacher, train_loader, test_loader)
 
         torch.save({
             "encoder": encoder.state_dict(),
             "summarizer": summarizer.state_dict(),
             "token_proj": token_proj.state_dict(),
-        }, os.path.join(OUT_DIR, "compression_aware_encoder_16gate.pth"))
-        print(f"\nSaved policy to {os.path.join(OUT_DIR, 'compression_aware_encoder_16gate.pth')}")
-
+            "num_classes": num_classes
+        }, encoder_path)
+        print(f"\nSaved policy to {encoder_path}")
         print("\n" + "="*80)
     else:
         print("\nLoading pre-trained policy encoder...")
-        ckpt = torch.load(os.path.join(OUT_DIR, "compression_aware_encoder_16gate.pth"), map_location="cpu")
+        ckpt = torch.load(encoder_path, map_location="cpu")
         encoder = CompressionAwareEncoder(dim=ENC_WIDTH, depth=ENC_LAYERS, heads=ENC_HEADS, num_blocks=NUM_UNITS).to(device)
         encoder.load_state_dict(ckpt["encoder"])
         summarizer = Summarizer(sum_dim=SUM_DIM, k=64).to(device)
@@ -588,11 +627,10 @@ def main():
         token_proj.load_state_dict(ckpt["token_proj"])
         print("Policy encoder loaded.\n")
     
-    
     print("PHASE 2: Materializing Masks and Fine-tuning Pruned Models (16-gate)")
     print("="*80)
 
-    results = {"teacher_accuracy": teacher_acc * 100, "eval_ratios": []}
+    results = {"teacher_accuracy": teacher_acc * 100, "num_classes": num_classes, "eval_ratios": []}
 
     for target_ratio in EVAL_RATIOS:
         print(f"\n{'='*80}\nTarget Ratio: {target_ratio:.1f}\n{'='*80}")
@@ -604,7 +642,7 @@ def main():
         print(f"Mask keep count: {int(mask.sum().item())}/16")
         print(f"Actual ratio: {actual_ratio:.3f} (target: {target_ratio:.1f})")
 
-        student_before = build_resnet18_teacher(num_classes=10).to(device)
+        student_before = build_resnet18_teacher(num_classes=num_classes).to(device)
         student_before.load_state_dict(teacher.state_dict())
         acc_before = evaluate_accuracy(student_before, test_loader, mask)
         print(f"\nAccuracy before fine-tuning: {acc_before*100:.2f}%")
@@ -633,14 +671,13 @@ def main():
               f"Actual={actual_ratio:.3f}  Kept={int(mask.sum().item())}/16")
         print(f"{'─'*80}")
 
-    results_path = os.path.join(OUT_DIR, "..", "compression_analysis", RESULTS_FILE)
-    os.makedirs(os.path.dirname(results_path), exist_ok=True)
+    results_path = os.path.join(OUT_DIR, RESULTS_FILE)
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     print(f"\n{'='*80}\nAll results saved to: {results_path}\n{'='*80}")
 
     print("\n" + "="*80)
-    print("FINAL COMPARISON TABLE (16-gate)")
+    print("FINAL COMPARISON TABLE (16-gate, Tiny ImageNet-200)")
     print("="*80)
     print(f"{'Ratio':<8} {'Actual':<8} {'Kept':<6} {'Before FT':<12} {'After FT':<12} {'Drop':<10}")
     print("-"*80)
