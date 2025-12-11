@@ -1,6 +1,6 @@
-# README.md - AZ-NAS Experiments (CIFAR-10 / CIFAR-100)
+# README.md - AZ-NAS Experiments (TinyImageNet / CIFAR-100)
 
-This repository contains three GPU-accelerated experiments for **AZ-NAS** (Architectural Zero-shot Neural Architecture Search) implemented using **PyTorch**.
+This repository contains three GPU-accelerated experiments for **AZ-NAS** (Assembling Zero-shot proxies for Neural Architecture Search) implemented using **PyTorch**.
 All scripts include two special modes:
 
 * **--fast_full** - ~20 minute full experiment (recommended)
@@ -141,7 +141,7 @@ Format may be:
 
 or a raw `state_dict` - both work.
 
-### CIFAR-10 teacher
+### TinyImageNet teacher
 
 Used only in **overfitting test**, optional:
 
@@ -154,14 +154,6 @@ If missing - the script trains it automatically.
 ---
 
 ## 4. How to Run Each Script
-
-Run everything from inside the root folder:
-
-```
-aznas_experiments/
-```
-
----
 
 ### A. 9_aznas_loss_c100.py
 
@@ -225,7 +217,7 @@ python 9_aznas_component_ablation.py --quick_test
 
 **Purpose:**
 
-1. Train AZ-NAS policy on CIFAR-10
+1. Train AZ-NAS policy on TinyImageNet
 2. Apply this old policy to CIFAR-100 (transfer test)
 3. Train new policy directly on CIFAR-100
 4. Compare performance:
